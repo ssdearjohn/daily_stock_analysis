@@ -65,6 +65,9 @@ class Config:
     
     # 飞书 Webhook
     feishu_webhook_url: Optional[str] = None
+
+    # 飞书 Webhook
+    dingtalk_webhook_url: Optional[str] = None
     
     # Telegram 配置（需要同时配置 Bot Token 和 Chat ID）
     telegram_bot_token: Optional[str] = None  # Bot Token（@BotFather 获取）
@@ -81,6 +84,7 @@ class Config:
     
     # 消息长度限制（字节）- 超长自动分批发送
     feishu_max_bytes: int = 20000  # 飞书限制约 20KB，默认 20000 字节
+    dingtalk_max_bytes: int = 20000  # 钉钉限制约 20KB，默认 20000 字节
     wechat_max_bytes: int = 4000   # 企业微信限制 4096 字节，默认 4000 字节
     
     # === 数据库配置 ===
@@ -181,6 +185,7 @@ class Config:
             serpapi_keys=serpapi_keys,
             wechat_webhook_url=os.getenv('WECHAT_WEBHOOK_URL'),
             feishu_webhook_url=os.getenv('FEISHU_WEBHOOK_URL'),
+            dingtalk_webhook_url=os.getenv('DINGTALK_WEBHOOK_URL'),
             telegram_bot_token=os.getenv('TELEGRAM_BOT_TOKEN'),
             telegram_chat_id=os.getenv('TELEGRAM_CHAT_ID'),
             email_sender=os.getenv('EMAIL_SENDER'),
@@ -188,6 +193,7 @@ class Config:
             email_receivers=[r.strip() for r in os.getenv('EMAIL_RECEIVERS', '').split(',') if r.strip()],
             custom_webhook_urls=[u.strip() for u in os.getenv('CUSTOM_WEBHOOK_URLS', '').split(',') if u.strip()],
             feishu_max_bytes=int(os.getenv('FEISHU_MAX_BYTES', '20000')),
+            dingtalk_max_bytes=int(os.getenv('DINGTALK_MAX_BYTES', '20000')),
             wechat_max_bytes=int(os.getenv('WECHAT_MAX_BYTES', '4000')),
             database_path=os.getenv('DATABASE_PATH', './data/stock_analysis.db'),
             log_dir=os.getenv('LOG_DIR', './logs'),
@@ -260,6 +266,7 @@ class Config:
         has_notification = (
             self.wechat_webhook_url or 
             self.feishu_webhook_url or
+            self.dingtalk_webhook_url or
             (self.telegram_bot_token and self.telegram_chat_id) or
             (self.email_sender and self.email_password)
         )
