@@ -203,7 +203,7 @@ class TavilySearchProvider(BaseSearchProvider):
         try:
             client = TavilyClient(api_key=api_key)
             
-            # 执行搜索（优化：使用advanced深度、限制最近7天）
+            # 执行搜索（优化：使用advanced深度、限制最近3天）
             response = client.search(
                 query=query,
                 search_depth="advanced",  # advanced 获取更多结果
@@ -524,12 +524,12 @@ class SearchService:
             },
             {
                 'name': 'risk_check', 
-                'query': f"{stock_name} 减持 处罚 利空 风险",
+                'query': f"{stock_name} {stock_code} 减持 处罚 利空 风险",
                 'desc': '风险排查'
             },
             {
                 'name': 'earnings',
-                'query': f"{stock_name} 年报预告 业绩预告 业绩快报 2025年报",
+                'query': f"{stock_name} {stock_code} 2025年年报预告 2026年业绩预告 2026年业绩快报 2025年第三季报 2025年年报 2025年第四季报",
                 'desc': '业绩预期'
             },
         ]
