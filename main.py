@@ -595,6 +595,8 @@ class StockAnalysisPipeline:
                         continue
                     if channel == NotificationChannel.FEISHU:
                         non_wechat_success = self.notifier.send_to_feishu(report) or non_wechat_success
+                    if channel == NotificationChannel.DINGTALK:
+                        non_wechat_success = self.notifier.send_to_dingtalk(report) or non_wechat_success
                     elif channel == NotificationChannel.TELEGRAM:
                         non_wechat_success = self.notifier.send_to_telegram(report) or non_wechat_success
                     elif channel == NotificationChannel.EMAIL:
