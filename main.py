@@ -1,915 +1,1224 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-A股自选股智能分析系统 - 主调度程序
+A股自选股智能分析系统 - AI分析层
 ===================================
 
 职责：
-1. 协调各模块完成股票分析流程
-2. 实现低并发的线程池调度
-3. 全局异常处理，确保单股失败不影响整体
-4. 提供命令行入口
-
-使用方式：
-    python main.py              # 正常运行
-    python main.py --debug      # 调试模式
-    python main.py --dry-run    # 仅获取数据不分析
-
-交易理念（已融入分析）：
-- 严进策略：不追高，乖离率 > 5% 不买入
-- 趋势交易：只做 MA5>MA10>MA20 多头排列
-- 效率优先：关注筹码集中度好的股票
-- 买点偏好：缩量回踩 MA5/MA10 支撑
+1. 封装 Gemini API 调用逻辑
+2. 利用 Google Search Grounding 获取实时新闻
+3. 结合技术面和消息面生成分析报告
 """
-import os
 
-# 代理配置 - 仅在本地环境使用，GitHub Actions 不需要
-if os.getenv("GITHUB_ACTIONS") != "true":
-    # 本地开发环境，如需代理请取消注释或修改端口
-    # os.environ["http_proxy"] = "http://127.0.0.1:10809"
-    # os.environ["https_proxy"] = "http://127.0.0.1:10809"
-    pass
-
-import argparse
+import json
 import logging
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date, timezone, timedelta
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from feishu_doc import FeishuDocManager
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List
 
-from config import get_config, Config
-from storage import get_db, DatabaseManager
-from data_provider import DataFetcherManager
-from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDistribution
-from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
-from notification import NotificationService, NotificationChannel, send_daily_report
-from search_service import SearchService, SearchResponse
-from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
-from market_analyzer import MarketAnalyzer
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_sleep_log,
+)
 
-# 配置日志格式
-LOG_FORMAT = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
-LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
-
-
-def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
-    """
-    配置日志系统（同时输出到控制台和文件）
-    
-    Args:
-        debug: 是否启用调试模式
-        log_dir: 日志文件目录
-    """
-    level = logging.DEBUG if debug else logging.INFO
-    
-    # 创建日志目录
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
-    
-    # 日志文件路径（按日期分文件）
-    today_str = datetime.now().strftime('%Y%m%d')
-    log_file = log_path / f"stock_analysis_{today_str}.log"
-    debug_log_file = log_path / f"stock_analysis_debug_{today_str}.log"
-    
-    # 创建根 logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # 根 logger 设为 DEBUG，由 handler 控制输出级别
-    
-    # Handler 1: 控制台输出
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
-    root_logger.addHandler(console_handler)
-    
-    # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=10 * 1024 * 1024,  # 10MB
-        backupCount=5,
-        encoding='utf-8'
-    )
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
-    root_logger.addHandler(file_handler)
-    
-    # Handler 3: 调试日志文件（DEBUG 级别，包含所有详细信息）
-    debug_handler = RotatingFileHandler(
-        debug_log_file,
-        maxBytes=50 * 1024 * 1024,  # 50MB
-        backupCount=3,
-        encoding='utf-8'
-    )
-    debug_handler.setLevel(logging.DEBUG)
-    debug_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
-    root_logger.addHandler(debug_handler)
-    
-    # 降低第三方库的日志级别
-    logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
-    logging.getLogger('google').setLevel(logging.WARNING)
-    logging.getLogger('httpx').setLevel(logging.WARNING)
-    
-    logging.info(f"日志系统初始化完成，日志目录: {log_path.absolute()}")
-    logging.info(f"常规日志: {log_file}")
-    logging.info(f"调试日志: {debug_log_file}")
-
+from config import get_config
 
 logger = logging.getLogger(__name__)
 
 
-class StockAnalysisPipeline:
+# 股票名称映射（常见股票）
+STOCK_NAME_MAP = {
+    '002326': '永太科技',
+    '600481': '双良节能',
+    '605020': '永和股份',
+    '301127': '武汉天源',
+    '300133': '华策影视',
+    '002407': '多氟多',
+    '603306': '华懋科技',
+    '002152': '广电运通',
+    '600497': '驰宏锌锗',
+    '002600': '领益智造',
+    '301510': '固高科技',
+    '600673': '东阳光',
+    '000657': '中钨高新',
+    '601600': '中国铝业',
+    '002970': '锐明技术',
+    '300905': '宝丽迪'
+}
+
+
+@dataclass
+class AnalysisResult:
     """
-    股票分析主流程调度器
+    AI 分析结果数据类 - 决策仪表盘版
+    
+    封装 Gemini 返回的分析结果，包含决策仪表盘和详细分析
+    """
+    code: str
+    name: str
+    
+    # ========== 核心指标 ==========
+    sentiment_score: int  # 综合评分 0-100 (>70强烈看多, >60看多, 40-60震荡, <40看空)
+    trend_prediction: str  # 趋势预测：强烈看多/看多/震荡/看空/强烈看空
+    operation_advice: str  # 操作建议：买入/加仓/持有/减仓/卖出/观望
+    confidence_level: str = "中"  # 置信度：高/中/低
+    
+    # ========== 决策仪表盘 (新增) ==========
+    dashboard: Optional[Dict[str, Any]] = None  # 完整的决策仪表盘数据
+    
+    # ========== 走势分析 ==========
+    trend_analysis: str = ""  # 走势形态分析（支撑位、压力位、趋势线等）
+    short_term_outlook: str = ""  # 短期展望（1-3日）
+    medium_term_outlook: str = ""  # 中期展望（1-2周）
+    
+    # ========== 技术面分析 ==========
+    technical_analysis: str = ""  # 技术指标综合分析
+    ma_analysis: str = ""  # 均线分析（多头/空头排列，金叉/死叉等）
+    volume_analysis: str = ""  # 量能分析（放量/缩量，主力动向等）
+    pattern_analysis: str = ""  # K线形态分析
+    
+    # ========== 基本面分析 ==========
+    fundamental_analysis: str = ""  # 基本面综合分析
+    sector_position: str = ""  # 板块地位和行业趋势
+    company_highlights: str = ""  # 公司亮点/风险点
+    
+    # ========== 情绪面/消息面分析 ==========
+    news_summary: str = ""  # 近期重要新闻/公告摘要
+    market_sentiment: str = ""  # 市场情绪分析
+    hot_topics: str = ""  # 相关热点话题
+    
+    # ========== 综合分析 ==========
+    analysis_summary: str = ""  # 综合分析摘要
+    key_points: str = ""  # 核心看点（3-5个要点）
+    risk_warning: str = ""  # 风险提示
+    buy_reason: str = ""  # 买入/卖出理由
+    
+    # ========== 元数据 ==========
+    raw_response: Optional[str] = None  # 原始响应（调试用）
+    search_performed: bool = False  # 是否执行了联网搜索
+    data_sources: str = ""  # 数据来源说明
+    success: bool = True
+    error_message: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典"""
+        return {
+            'code': self.code,
+            'name': self.name,
+            'sentiment_score': self.sentiment_score,
+            'trend_prediction': self.trend_prediction,
+            'operation_advice': self.operation_advice,
+            'confidence_level': self.confidence_level,
+            'dashboard': self.dashboard,  # 决策仪表盘数据
+            'trend_analysis': self.trend_analysis,
+            'short_term_outlook': self.short_term_outlook,
+            'medium_term_outlook': self.medium_term_outlook,
+            'technical_analysis': self.technical_analysis,
+            'ma_analysis': self.ma_analysis,
+            'volume_analysis': self.volume_analysis,
+            'pattern_analysis': self.pattern_analysis,
+            'fundamental_analysis': self.fundamental_analysis,
+            'sector_position': self.sector_position,
+            'company_highlights': self.company_highlights,
+            'news_summary': self.news_summary,
+            'market_sentiment': self.market_sentiment,
+            'hot_topics': self.hot_topics,
+            'analysis_summary': self.analysis_summary,
+            'key_points': self.key_points,
+            'risk_warning': self.risk_warning,
+            'buy_reason': self.buy_reason,
+            'search_performed': self.search_performed,
+            'success': self.success,
+            'error_message': self.error_message,
+        }
+    
+    def get_core_conclusion(self) -> str:
+        """获取核心结论（一句话）"""
+        if self.dashboard and 'core_conclusion' in self.dashboard:
+            return self.dashboard['core_conclusion'].get('one_sentence', self.analysis_summary)
+        return self.analysis_summary
+    
+    def get_position_advice(self, has_position: bool = False) -> str:
+        """获取持仓建议"""
+        if self.dashboard and 'core_conclusion' in self.dashboard:
+            pos_advice = self.dashboard['core_conclusion'].get('position_advice', {})
+            if has_position:
+                return pos_advice.get('has_position', self.operation_advice)
+            return pos_advice.get('no_position', self.operation_advice)
+        return self.operation_advice
+    
+    def get_sniper_points(self) -> Dict[str, str]:
+        """获取狙击点位"""
+        if self.dashboard and 'battle_plan' in self.dashboard:
+            return self.dashboard['battle_plan'].get('sniper_points', {})
+        return {}
+    
+    def get_checklist(self) -> List[str]:
+        """获取检查清单"""
+        if self.dashboard and 'battle_plan' in self.dashboard:
+            return self.dashboard['battle_plan'].get('action_checklist', [])
+        return []
+    
+    def get_risk_alerts(self) -> List[str]:
+        """获取风险警报"""
+        if self.dashboard and 'intelligence' in self.dashboard:
+            return self.dashboard['intelligence'].get('risk_alerts', [])
+        return []
+    
+    def get_emoji(self) -> str:
+        """根据操作建议返回对应 emoji"""
+        emoji_map = {
+            '买入': '🟢',
+            '加仓': '🟢',
+            '强烈买入': '💚',
+            '持有': '🟡',
+            '观望': '⚪',
+            '减仓': '🟠',
+            '卖出': '🔴',
+            '强烈卖出': '❌',
+        }
+        return emoji_map.get(self.operation_advice, '🟡')
+    
+    def get_confidence_stars(self) -> str:
+        """返回置信度星级"""
+        star_map = {'高': '⭐⭐⭐', '中': '⭐⭐', '低': '⭐'}
+        return star_map.get(self.confidence_level, '⭐⭐')
+
+
+class GeminiAnalyzer:
+    """
+    Gemini AI 分析器
     
     职责：
-    1. 管理整个分析流程
-    2. 协调数据获取、存储、搜索、分析、通知等模块
-    3. 实现并发控制和异常处理
+    1. 调用 Google Gemini API 进行股票分析
+    2. 结合预先搜索的新闻和技术面数据生成分析报告
+    3. 解析 AI 返回的 JSON 格式结果
+    
+    使用方式：
+        analyzer = GeminiAnalyzer()
+        result = analyzer.analyze(context, news_context)
     """
     
-    def __init__(
-        self,
-        config: Optional[Config] = None,
-        max_workers: Optional[int] = None
-    ):
+    # ========================================
+    # 系统提示词 - 决策仪表盘 v2.0
+    # ========================================
+    # 输出格式升级：从简单信号升级为决策仪表盘
+    # 核心模块：核心结论 + 数据透视 + 舆情情报 + 作战计划
+    # ========================================
+    
+    SYSTEM_PROMPT = """你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+
+## 核心交易理念（必须严格遵守）
+
+### 1. 严进策略（不追高）
+- **绝对不追高**：当股价偏离 MA5 超过 5% 时，坚决不买入
+- **乖离率公式**：(现价 - MA5) / MA5 × 100%
+- 乖离率 < 2%：最佳买点区间
+- 乖离率 2-5%：可小仓介入
+- 乖离率 > 5%：严禁追高！直接判定为"观望"
+
+### 2. 趋势交易（顺势而为）
+- **多头排列必须条件**：MA5 > MA10 > MA20
+- 只做多头排列的股票，空头排列坚决不碰
+- 均线发散上行优于均线粘合
+- 趋势强度判断：看均线间距是否在扩大
+
+### 3. 效率优先（筹码结构）
+- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
+- 获利比例分析：70-90% 获利盘时需警惕获利回吐
+- 平均成本与现价关系：现价高于平均成本 5-15% 为健康
+
+### 4. 买点偏好（回踩支撑）
+- **最佳买点**：缩量回踩 MA5 获得支撑
+- **次优买点**：回踩 MA10 获得支撑
+- **观望情况**：跌破 MA20 时观望
+
+### 5. 风险排查重点
+- 减持公告（股东、高管减持）
+- 业绩预亏/大幅下滑
+- 监管处罚/立案调查
+- 行业政策利空
+- 大额解禁
+
+## 输出格式：决策仪表盘 JSON
+
+请严格按照以下 JSON 格式输出，这是一个完整的【决策仪表盘】：
+
+```json
+{
+    "sentiment_score": 0-100整数,
+    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
+    "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
+    "confidence_level": "高/中/低",
+    
+    "dashboard": {
+        "core_conclusion": {
+            "one_sentence": "一句话核心结论（30字以内，直接告诉用户做什么）",
+            "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
+            "time_sensitivity": "立即行动/今日内/本周内/不急",
+            "position_advice": {
+                "no_position": "空仓者建议：具体操作指引",
+                "has_position": "持仓者建议：具体操作指引"
+            }
+        },
+        
+        "data_perspective": {
+            "trend_status": {
+                "ma_alignment": "均线排列状态描述",
+                "is_bullish": true/false,
+                "trend_score": 0-100
+            },
+            "price_position": {
+                "current_price": 当前价格数值,
+                "ma5": MA5数值,
+                "ma10": MA10数值,
+                "ma20": MA20数值,
+                "bias_ma5": 乖离率百分比数值,
+                "bias_status": "安全/警戒/危险",
+                "support_level": 支撑位价格,
+                "resistance_level": 压力位价格
+            },
+            "volume_analysis": {
+                "volume_ratio": 量比数值,
+                "volume_status": "放量/缩量/平量",
+                "turnover_rate": 换手率百分比,
+                "volume_meaning": "量能含义解读（如：缩量回调表示抛压减轻）"
+            },
+            "chip_structure": {
+                "profit_ratio": 获利比例,
+                "avg_cost": 平均成本,
+                "concentration": 筹码集中度,
+                "chip_health": "健康/一般/警惕"
+            }
+        },
+        
+        "intelligence": {
+            "latest_news": "【最新消息】近期重要新闻摘要",
+            "risk_alerts": ["风险点1：具体描述", "风险点2：具体描述"],
+            "positive_catalysts": ["利好1：具体描述", "利好2：具体描述"],
+            "earnings_outlook": "业绩预期分析（基于年报预告、业绩快报等）",
+            "sentiment_summary": "舆情情绪一句话总结"
+        },
+        
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": "理想买入点：XX元（在MA5附近）",
+                "secondary_buy": "次优买入点：XX元（在MA10附近）",
+                "stop_loss": "止损位：XX元（跌破MA20或X%）",
+                "take_profit": "目标位：XX元（前高/整数关口）"
+            },
+            "position_strategy": {
+                "suggested_position": "建议仓位：X成",
+                "entry_plan": "分批建仓策略描述",
+                "risk_control": "风控策略描述"
+            },
+            "action_checklist": [
+                "✅/⚠️/❌ 检查项1：多头排列",
+                "✅/⚠️/❌ 检查项2：乖离率<5%",
+                "✅/⚠️/❌ 检查项3：量能配合",
+                "✅/⚠️/❌ 检查项4：无重大利空",
+                "✅/⚠️/❌ 检查项5：筹码健康"
+            ]
+        }
+    },
+    
+    "analysis_summary": "100字综合分析摘要",
+    "key_points": "3-5个核心看点，逗号分隔",
+    "risk_warning": "风险提示",
+    "buy_reason": "操作理由，引用交易理念",
+    
+    "trend_analysis": "走势形态分析",
+    "short_term_outlook": "短期1-3日展望",
+    "medium_term_outlook": "中期1-2周展望",
+    "technical_analysis": "技术面综合分析",
+    "ma_analysis": "均线系统分析",
+    "volume_analysis": "量能分析",
+    "pattern_analysis": "K线形态分析",
+    "fundamental_analysis": "基本面分析",
+    "sector_position": "板块行业分析",
+    "company_highlights": "公司亮点/风险",
+    "news_summary": "新闻摘要",
+    "market_sentiment": "市场情绪",
+    "hot_topics": "相关热点",
+    
+    "search_performed": true/false,
+    "data_sources": "数据来源说明"
+}
+```
+
+## 评分标准
+
+### 强烈买入（80-100分）：
+- ✅ 多头排列：MA5 > MA10 > MA20
+- ✅ 低乖离率：<2%，最佳买点
+- ✅ 缩量回调或放量突破
+- ✅ 筹码集中健康
+- ✅ 消息面有利好催化
+
+### 买入（60-79分）：
+- ✅ 多头排列或弱势多头
+- ✅ 乖离率 <5%
+- ✅ 量能正常
+- ⚪ 允许一项次要条件不满足
+
+### 观望（40-59分）：
+- ⚠️ 乖离率 >5%（追高风险）
+- ⚠️ 均线缠绕趋势不明
+- ⚠️ 有风险事件
+
+### 卖出/减仓（0-39分）：
+- ❌ 空头排列
+- ❌ 跌破MA20
+- ❌ 放量下跌
+- ❌ 重大利空
+
+## 决策仪表盘核心原则
+
+1. **核心结论先行**：一句话说清该买该卖
+2. **分持仓建议**：空仓者和持仓者给不同建议
+3. **精确狙击点**：必须给出具体价格，不说模糊的话
+4. **检查清单可视化**：用 ✅⚠️❌ 明确显示每项检查结果
+5. **风险优先级**：舆情中的风险点要醒目标出"""
+
+    def __init__(self, api_key: Optional[str] = None):
         """
-        初始化调度器
+        初始化 AI 分析器
+        
+        优先级：Gemini > OpenAI 兼容 API
         
         Args:
-            config: 配置对象（可选，默认使用全局配置）
-            max_workers: 最大并发线程数（可选，默认从配置读取）
+            api_key: Gemini API Key（可选，默认从配置读取）
         """
-        self.config = config or get_config()
-        self.max_workers = max_workers or self.config.max_workers
+        config = get_config()
+        self._api_key = api_key or config.gemini_api_key
+        self._model = None
+        self._current_model_name = None  # 当前使用的模型名称
+        self._using_fallback = False  # 是否正在使用备选模型
+        self._use_openai = False  # 是否使用 OpenAI 兼容 API
+        self._openai_client = None  # OpenAI 客户端
         
-        # 初始化各模块
-        self.db = get_db()
-        self.fetcher_manager = DataFetcherManager()
-        self.akshare_fetcher = AkshareFetcher()  # 用于获取增强数据（量比、筹码等）
-        self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
-        self.analyzer = GeminiAnalyzer()
-        self.notifier = NotificationService()
+        # 检查 Gemini API Key 是否有效（过滤占位符）
+        gemini_key_valid = self._api_key and not self._api_key.startswith('your_') and len(self._api_key) > 10
         
-        # 初始化搜索服务
-        self.search_service = SearchService(
-            tavily_keys=self.config.tavily_api_keys,
-            serpapi_keys=self.config.serpapi_keys,
+        # 优先尝试初始化 Gemini
+        if gemini_key_valid:
+            try:
+                self._init_model()
+            except Exception as e:
+                logger.warning(f"Gemini 初始化失败: {e}，尝试 OpenAI 兼容 API")
+                self._init_openai_fallback()
+        else:
+            # Gemini Key 未配置，尝试 OpenAI
+            logger.info("Gemini API Key 未配置，尝试使用 OpenAI 兼容 API")
+            self._init_openai_fallback()
+        
+        # 两者都未配置
+        if not self._model and not self._openai_client:
+            logger.warning("未配置任何 AI API Key，AI 分析功能将不可用")
+    
+    def _init_openai_fallback(self) -> None:
+        """
+        初始化 OpenAI 兼容 API 作为备选
+        
+        支持所有 OpenAI 格式的 API，包括：
+        - OpenAI 官方
+        - DeepSeek
+        - 通义千问
+        - Moonshot 等
+        """
+        config = get_config()
+        
+        # 检查 OpenAI API Key 是否有效（过滤占位符）
+        openai_key_valid = (
+            config.openai_api_key and 
+            not config.openai_api_key.startswith('your_') and 
+            len(config.openai_api_key) > 10
         )
         
-        logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
-        logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
-        if self.search_service.is_available:
-            logger.info("搜索服务已启用 (Tavily/SerpAPI)")
-        else:
-            logger.warning("搜索服务未启用（未配置 API Key）")
-    
-    def fetch_and_save_stock_data(
-        self, 
-        code: str,
-        force_refresh: bool = False
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        获取并保存单只股票数据
+        if not openai_key_valid:
+            logger.debug("OpenAI 兼容 API 未配置或配置无效")
+            return
         
-        断点续传逻辑：
-        1. 检查数据库是否已有今日数据
-        2. 如果有且不强制刷新，则跳过网络请求
-        3. 否则从数据源获取并保存
+        # 分离 import 和客户端创建，以便提供更准确的错误信息
+        try:
+            from openai import OpenAI
+        except ImportError:
+            logger.error("未安装 openai 库，请运行: pip install openai")
+            return
         
-        Args:
-            code: 股票代码
-            force_refresh: 是否强制刷新（忽略本地缓存）
+        try:
+            # base_url 可选，不填则使用 OpenAI 官方默认地址
+            client_kwargs = {"api_key": config.openai_api_key}
+            if config.openai_base_url and config.openai_base_url.startswith('http'):
+                client_kwargs["base_url"] = config.openai_base_url
             
-        Returns:
-            Tuple[是否成功, 错误信息]
+            self._openai_client = OpenAI(**client_kwargs)
+            self._current_model_name = config.openai_model
+            self._use_openai = True
+            logger.info(f"OpenAI 兼容 API 初始化成功 (base_url: {config.openai_base_url}, model: {config.openai_model})")
+        except ImportError as e:
+            # 依赖缺失（如 socksio）
+            if 'socksio' in str(e).lower() or 'socks' in str(e).lower():
+                logger.error(f"OpenAI 客户端需要 SOCKS 代理支持，请运行: pip install httpx[socks] 或 pip install socksio")
+            else:
+                logger.error(f"OpenAI 依赖缺失: {e}")
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'socks' in error_msg or 'socksio' in error_msg or 'proxy' in error_msg:
+                logger.error(f"OpenAI 代理配置错误: {e}，如使用 SOCKS 代理请运行: pip install httpx[socks]")
+            else:
+                logger.error(f"OpenAI 兼容 API 初始化失败: {e}")
+    
+    def _init_model(self) -> None:
+        """
+        初始化 Gemini 模型
+        
+        配置：
+        - 使用 gemini-3-flash-preview 或 gemini-2.5-flash 模型
+        - 不启用 Google Search（使用外部 Tavily/SerpAPI 搜索）
         """
         try:
-            today = date.today()
+            import google.generativeai as genai
             
-            # 断点续传检查：如果今日数据已存在，跳过
-            if not force_refresh and self.db.has_today_data(code, today):
-                logger.info(f"[{code}] 今日数据已存在，跳过获取（断点续传）")
-                return True, None
+            # 配置 API Key
+            genai.configure(api_key=self._api_key)
             
-            # 从数据源获取数据
-            logger.info(f"[{code}] 开始从数据源获取数据...")
-            df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+            # 从配置获取模型名称
+            config = get_config()
+            model_name = config.gemini_model
+            fallback_model = config.gemini_model_fallback
             
-            if df is None or df.empty:
-                return False, "获取数据为空"
+            # 不再使用 Google Search Grounding（已知有兼容性问题）
+            # 改为使用外部搜索服务（Tavily/SerpAPI）预先获取新闻
             
-            # 保存到数据库
-            saved_count = self.db.save_daily_data(df, code, source_name)
-            logger.info(f"[{code}] 数据保存成功（来源: {source_name}，新增 {saved_count} 条）")
-            
-            return True, None
+            # 尝试初始化主模型
+            try:
+                self._model = genai.GenerativeModel(
+                    model_name=model_name,
+                    system_instruction=self.SYSTEM_PROMPT,
+                )
+                self._current_model_name = model_name
+                self._using_fallback = False
+                logger.info(f"Gemini 模型初始化成功 (模型: {model_name})")
+            except Exception as model_error:
+                # 尝试备选模型
+                logger.warning(f"主模型 {model_name} 初始化失败: {model_error}，尝试备选模型 {fallback_model}")
+                self._model = genai.GenerativeModel(
+                    model_name=fallback_model,
+                    system_instruction=self.SYSTEM_PROMPT,
+                )
+                self._current_model_name = fallback_model
+                self._using_fallback = True
+                logger.info(f"Gemini 备选模型初始化成功 (模型: {fallback_model})")
             
         except Exception as e:
-            error_msg = f"获取/保存数据失败: {str(e)}"
-            logger.error(f"[{code}] {error_msg}")
-            return False, error_msg
+            logger.error(f"Gemini 模型初始化失败: {e}")
+            self._model = None
     
-    def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
+    def _switch_to_fallback_model(self) -> bool:
         """
-        分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
+        切换到备选模型
+        
+        Returns:
+            是否成功切换
+        """
+        try:
+            import google.generativeai as genai
+            config = get_config()
+            fallback_model = config.gemini_model_fallback
+            
+            logger.warning(f"[LLM] 切换到备选模型: {fallback_model}")
+            self._model = genai.GenerativeModel(
+                model_name=fallback_model,
+                system_instruction=self.SYSTEM_PROMPT,
+            )
+            self._current_model_name = fallback_model
+            self._using_fallback = True
+            logger.info(f"[LLM] 备选模型 {fallback_model} 初始化成功")
+            return True
+        except Exception as e:
+            logger.error(f"[LLM] 切换备选模型失败: {e}")
+            return False
+    
+    def is_available(self) -> bool:
+        """检查分析器是否可用"""
+        return self._model is not None or self._openai_client is not None
+    
+    def _call_openai_api(self, prompt: str, generation_config: dict) -> str:
+        """
+        调用 OpenAI 兼容 API
+        
+        Args:
+            prompt: 提示词
+            generation_config: 生成配置
+            
+        Returns:
+            响应文本
+        """
+        config = get_config()
+        max_retries = config.gemini_max_retries
+        base_delay = config.gemini_retry_delay
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1))
+                    delay = min(delay, 60)
+                    logger.info(f"[OpenAI] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    time.sleep(delay)
+                
+                response = self._openai_client.chat.completions.create(
+                    model=self._current_model_name,
+                    messages=[
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=generation_config.get('temperature', 0.7),
+                    max_tokens=generation_config.get('max_output_tokens', 8192),
+                )
+                
+                if response and response.choices and response.choices[0].message.content:
+                    return response.choices[0].message.content
+                else:
+                    raise ValueError("OpenAI API 返回空响应")
+                    
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = '429' in error_str or 'rate' in error_str.lower() or 'quota' in error_str.lower()
+                
+                if is_rate_limit:
+                    logger.warning(f"[OpenAI] API 限流，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                else:
+                    logger.warning(f"[OpenAI] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                
+                if attempt == max_retries - 1:
+                    raise
+        
+        raise Exception("OpenAI API 调用失败，已达最大重试次数")
+    
+    def _call_api_with_retry(self, prompt: str, generation_config: dict) -> str:
+        """
+        调用 AI API，带有重试和模型切换机制
+        
+        优先级：Gemini > Gemini 备选模型 > OpenAI 兼容 API
+        
+        处理 429 限流错误：
+        1. 先指数退避重试
+        2. 多次失败后切换到备选模型
+        3. Gemini 完全失败后尝试 OpenAI
+        
+        Args:
+            prompt: 提示词
+            generation_config: 生成配置
+            
+        Returns:
+            响应文本
+        """
+        # 如果已经在使用 OpenAI 模式，直接调用 OpenAI
+        if self._use_openai:
+            return self._call_openai_api(prompt, generation_config)
+        
+        config = get_config()
+        max_retries = config.gemini_max_retries
+        base_delay = config.gemini_retry_delay
+        
+        last_error = None
+        tried_fallback = getattr(self, '_using_fallback', False)
+        
+        for attempt in range(max_retries):
+            try:
+                # 请求前增加延时（防止请求过快触发限流）
+                if attempt > 0:
+                    delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 5, 10, 20, 40...
+                    delay = min(delay, 60)  # 最大60秒
+                    logger.info(f"[Gemini] 第 {attempt + 1} 次重试，等待 {delay:.1f} 秒...")
+                    time.sleep(delay)
+                
+                response = self._model.generate_content(
+                    prompt,
+                    generation_config=generation_config,
+                    request_options={"timeout": 120}
+                )
+                
+                if response and response.text:
+                    return response.text
+                else:
+                    raise ValueError("Gemini 返回空响应")
+                    
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                
+                # 检查是否是 429 限流错误
+                is_rate_limit = '429' in error_str or 'quota' in error_str.lower() or 'rate' in error_str.lower()
+                
+                if is_rate_limit:
+                    logger.warning(f"[Gemini] API 限流 (429)，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+                    
+                    # 如果已经重试了一半次数且还没切换过备选模型，尝试切换
+                    if attempt >= max_retries // 2 and not tried_fallback:
+                        if self._switch_to_fallback_model():
+                            tried_fallback = True
+                            logger.info("[Gemini] 已切换到备选模型，继续重试")
+                        else:
+                            logger.warning("[Gemini] 切换备选模型失败，继续使用当前模型重试")
+                else:
+                    # 非限流错误，记录并继续重试
+                    logger.warning(f"[Gemini] API 调用失败，第 {attempt + 1}/{max_retries} 次尝试: {error_str[:100]}")
+        
+        # Gemini 所有重试都失败，尝试 OpenAI 兼容 API
+        if self._openai_client:
+            logger.warning("[Gemini] 所有重试失败，切换到 OpenAI 兼容 API")
+            try:
+                return self._call_openai_api(prompt, generation_config)
+            except Exception as openai_error:
+                logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
+                raise last_error or openai_error
+        elif config.openai_api_key and config.openai_base_url:
+            # 尝试懒加载初始化 OpenAI
+            logger.warning("[Gemini] 所有重试失败，尝试初始化 OpenAI 兼容 API")
+            self._init_openai_fallback()
+            if self._openai_client:
+                try:
+                    return self._call_openai_api(prompt, generation_config)
+                except Exception as openai_error:
+                    logger.error(f"[OpenAI] 备选 API 也失败: {openai_error}")
+                    raise last_error or openai_error
+        
+        # 所有方式都失败
+        raise last_error or Exception("所有 AI API 调用失败，已达最大重试次数")
+    
+    def analyze(
+        self, 
+        context: Dict[str, Any],
+        news_context: Optional[str] = None
+    ) -> AnalysisResult:
+        """
+        分析单只股票
         
         流程：
-        1. 获取实时行情（量比、换手率）
-        2. 获取筹码分布
-        3. 进行趋势分析（基于交易理念）
-        4. 多维度情报搜索（最新消息+风险排查+业绩预期）
-        5. 从数据库获取分析上下文
-        6. 调用 AI 进行综合分析
+        1. 格式化输入数据（技术面 + 新闻）
+        2. 调用 Gemini API（带重试和模型切换）
+        3. 解析 JSON 响应
+        4. 返回结构化结果
         
         Args:
-            code: 股票代码
+            context: 从 storage.get_analysis_context() 获取的上下文数据
+            news_context: 预先搜索的新闻内容（可选）
             
         Returns:
-            AnalysisResult 或 None（如果分析失败）
+            AnalysisResult 对象
         """
-        try:
-            # 获取股票名称（优先从实时行情获取真实名称）
-            stock_name = STOCK_NAME_MAP.get(code, '')
-            
-            # Step 1: 获取实时行情（量比、换手率等）
-            realtime_quote: Optional[RealtimeQuote] = None
-            try:
-                realtime_quote = self.akshare_fetcher.get_realtime_quote(code)
-                if realtime_quote:
-                    # 使用实时行情返回的真实股票名称
-                    if realtime_quote.name:
-                        stock_name = realtime_quote.name
-                    logger.info(f"[{code}] {stock_name} 实时行情: 价格={realtime_quote.price}, "
-                              f"量比={realtime_quote.volume_ratio}, 换手率={realtime_quote.turnover_rate}%")
-            except Exception as e:
-                logger.warning(f"[{code}] 获取实时行情失败: {e}")
-            
-            # 如果还是没有名称，使用代码作为名称
-            if not stock_name:
-                stock_name = f'股票{code}'
-            
-            # Step 2: 获取筹码分布
-            chip_data: Optional[ChipDistribution] = None
-            try:
-                chip_data = self.akshare_fetcher.get_chip_distribution(code)
-                if chip_data:
-                    logger.info(f"[{code}] 筹码分布: 获利比例={chip_data.profit_ratio:.1%}, "
-                              f"90%集中度={chip_data.concentration_90:.2%}")
-            except Exception as e:
-                logger.warning(f"[{code}] 获取筹码分布失败: {e}")
-            
-            # Step 3: 趋势分析（基于交易理念）
-            trend_result: Optional[TrendAnalysisResult] = None
-            try:
-                # 获取历史数据进行趋势分析
-                context = self.db.get_analysis_context(code)
-                if context and 'raw_data' in context:
-                    import pandas as pd
-                    raw_data = context['raw_data']
-                    if isinstance(raw_data, list) and len(raw_data) > 0:
-                        df = pd.DataFrame(raw_data)
-                        trend_result = self.trend_analyzer.analyze(df, code)
-                        logger.info(f"[{code}] 趋势分析: {trend_result.trend_status.value}, "
-                                  f"买入信号={trend_result.buy_signal.value}, 评分={trend_result.signal_score}")
-            except Exception as e:
-                logger.warning(f"[{code}] 趋势分析失败: {e}")
-            
-            # Step 4: 多维度情报搜索（最新消息+风险排查+业绩预期）
-            news_context = None
-            if self.search_service.is_available:
-                logger.info(f"[{code}] 开始多维度情报搜索...")
-                
-                # 使用多维度搜索（最多3次搜索）
-                intel_results = self.search_service.search_comprehensive_intel(
-                    stock_code=code,
-                    stock_name=stock_name,
-                    max_searches=3
-                )
-                
-                # 格式化情报报告
-                if intel_results:
-                    news_context = self.search_service.format_intel_report(intel_results, stock_name)
-                    total_results = sum(
-                        len(r.results) for r in intel_results.values() if r.success
-                    )
-                    logger.info(f"[{code}] 情报搜索完成: 共 {total_results} 条结果")
-                    logger.debug(f"[{code}] 情报搜索结果:\n{news_context}")
+        code = context.get('code', 'Unknown')
+        config = get_config()
+        
+        # 请求前增加延时（防止连续请求触发限流）
+        request_delay = config.gemini_request_delay
+        if request_delay > 0:
+            logger.debug(f"[LLM] 请求前等待 {request_delay:.1f} 秒...")
+            time.sleep(request_delay)
+        
+        # 优先从上下文获取股票名称（由 main.py 传入）
+        name = context.get('stock_name')
+        if not name or name.startswith('股票'):
+            # 备选：从 realtime 中获取
+            if 'realtime' in context and context['realtime'].get('name'):
+                name = context['realtime']['name']
             else:
-                logger.info(f"[{code}] 搜索服务不可用，跳过情报搜索")
-            
-            # Step 5: 获取分析上下文（技术面数据）
-            context = self.db.get_analysis_context(code)
-            
-            if context is None:
-                logger.warning(f"[{code}] 无法获取分析上下文，跳过分析")
-                return None
-            
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
-            enhanced_context = self._enhance_context(
-                context, 
-                realtime_quote, 
-                chip_data, 
-                trend_result,
-                stock_name  # 传入股票名称
+                # 最后从映射表获取
+                name = STOCK_NAME_MAP.get(code, f'股票{code}')
+        
+        # 如果模型不可用，返回默认结果
+        if not self.is_available():
+            return AnalysisResult(
+                code=code,
+                name=name,
+                sentiment_score=50,
+                trend_prediction='震荡',
+                operation_advice='持有',
+                confidence_level='低',
+                analysis_summary='AI 分析功能未启用（未配置 API Key）',
+                risk_warning='请配置 Gemini API Key 后重试',
+                success=False,
+                error_message='Gemini API Key 未配置',
             )
-            
-            # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
-            result = self.analyzer.analyze(enhanced_context, news_context=news_context)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"[{code}] 分析失败: {e}")
-            logger.exception(f"[{code}] 详细错误信息:")
-            return None
-    
-    def _enhance_context(
-        self,
-        context: Dict[str, Any],
-        realtime_quote: Optional[RealtimeQuote],
-        chip_data: Optional[ChipDistribution],
-        trend_result: Optional[TrendAnalysisResult],
-        stock_name: str = ""
-    ) -> Dict[str, Any]:
-        """
-        增强分析上下文
-        
-        将实时行情、筹码分布、趋势分析结果、股票名称添加到上下文中
-        
-        Args:
-            context: 原始上下文
-            realtime_quote: 实时行情数据
-            chip_data: 筹码分布数据
-            trend_result: 趋势分析结果
-            stock_name: 股票名称
-            
-        Returns:
-            增强后的上下文
-        """
-        enhanced = context.copy()
-        
-        # 添加股票名称
-        if stock_name:
-            enhanced['stock_name'] = stock_name
-        elif realtime_quote and realtime_quote.name:
-            enhanced['stock_name'] = realtime_quote.name
-        
-        # 添加实时行情
-        if realtime_quote:
-            enhanced['realtime'] = {
-                'name': realtime_quote.name,  # 股票名称
-                'price': realtime_quote.price,
-                'volume_ratio': realtime_quote.volume_ratio,
-                'volume_ratio_desc': self._describe_volume_ratio(realtime_quote.volume_ratio),
-                'turnover_rate': realtime_quote.turnover_rate,
-                'pe_ratio': realtime_quote.pe_ratio,
-                'pb_ratio': realtime_quote.pb_ratio,
-                'total_mv': realtime_quote.total_mv,
-                'circ_mv': realtime_quote.circ_mv,
-                'change_60d': realtime_quote.change_60d,
-            }
-        
-        # 添加筹码分布
-        if chip_data:
-            current_price = realtime_quote.price if realtime_quote else 0
-            enhanced['chip'] = {
-                'profit_ratio': chip_data.profit_ratio,
-                'avg_cost': chip_data.avg_cost,
-                'concentration_90': chip_data.concentration_90,
-                'concentration_70': chip_data.concentration_70,
-                'chip_status': chip_data.get_chip_status(current_price),
-            }
-        
-        # 添加趋势分析结果
-        if trend_result:
-            enhanced['trend_analysis'] = {
-                'trend_status': trend_result.trend_status.value,
-                'ma_alignment': trend_result.ma_alignment,
-                'trend_strength': trend_result.trend_strength,
-                'bias_ma5': trend_result.bias_ma5,
-                'bias_ma10': trend_result.bias_ma10,
-                'volume_status': trend_result.volume_status.value,
-                'volume_trend': trend_result.volume_trend,
-                'buy_signal': trend_result.buy_signal.value,
-                'signal_score': trend_result.signal_score,
-                'signal_reasons': trend_result.signal_reasons,
-                'risk_factors': trend_result.risk_factors,
-            }
-        
-        return enhanced
-    
-    def _describe_volume_ratio(self, volume_ratio: float) -> str:
-        """
-        量比描述
-        
-        量比 = 当前成交量 / 过去5日平均成交量
-        """
-        if volume_ratio < 0.5:
-            return "极度萎缩"
-        elif volume_ratio < 0.8:
-            return "明显萎缩"
-        elif volume_ratio < 1.2:
-            return "正常"
-        elif volume_ratio < 2.0:
-            return "温和放量"
-        elif volume_ratio < 3.0:
-            return "明显放量"
-        else:
-            return "巨量"
-    
-    def process_single_stock(
-        self, 
-        code: str,
-        skip_analysis: bool = False
-    ) -> Optional[AnalysisResult]:
-        """
-        处理单只股票的完整流程
-        
-        包括：
-        1. 获取数据
-        2. 保存数据
-        3. AI 分析
-        
-        此方法会被线程池调用，需要处理好异常
-        
-        Args:
-            code: 股票代码
-            skip_analysis: 是否跳过 AI 分析
-            
-        Returns:
-            AnalysisResult 或 None
-        """
-        logger.info(f"========== 开始处理 {code} ==========")
         
         try:
-            # Step 1: 获取并保存数据
-            success, error = self.fetch_and_save_stock_data(code)
+            # 格式化输入（包含技术面数据和新闻）
+            prompt = self._format_prompt(context, name, news_context)
             
-            if not success:
-                logger.warning(f"[{code}] 数据获取失败: {error}")
-                # 即使获取失败，也尝试用已有数据分析
+            # 获取模型名称
+            model_name = getattr(self, '_current_model_name', None)
+            if not model_name:
+                model_name = getattr(self._model, '_model_name', 'unknown')
+                if hasattr(self._model, 'model_name'):
+                    model_name = self._model.model_name
             
-            # Step 2: AI 分析
-            if skip_analysis:
-                logger.info(f"[{code}] 跳过 AI 分析（dry-run 模式）")
-                return None
+            logger.info(f"========== AI 分析 {name}({code}) ==========")
+            logger.info(f"[LLM配置] 模型: {model_name}")
+            logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
+            logger.info(f"[LLM配置] 是否包含新闻: {'是' if news_context else '否'}")
             
-            result = self.analyze_stock(code)
+            # 记录完整 prompt 到日志（INFO级别记录摘要，DEBUG记录完整）
+            prompt_preview = prompt[:500] + "..." if len(prompt) > 500 else prompt
+            logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
+            logger.debug(f"=== 完整 Prompt ({len(prompt)}字符) ===\n{prompt}\n=== End Prompt ===")
             
-            if result:
-                logger.info(
-                    f"[{code}] 分析完成: {result.operation_advice}, "
-                    f"评分 {result.sentiment_score}"
-                )
+            # 设置生成配置
+            generation_config = {
+                "temperature": 0.7,
+                "max_output_tokens": 8192,
+            }
+            
+            logger.info(f"[LLM调用] 开始调用 Gemini API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
+            
+            # 使用带重试的 API 调用
+            start_time = time.time()
+            response_text = self._call_api_with_retry(prompt, generation_config)
+            elapsed = time.time() - start_time
+            
+            # 记录响应信息
+            logger.info(f"[LLM返回] Gemini API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
+            
+            # 记录响应预览（INFO级别）和完整响应（DEBUG级别）
+            response_preview = response_text[:300] + "..." if len(response_text) > 300 else response_text
+            logger.info(f"[LLM返回 预览]\n{response_preview}")
+            logger.debug(f"=== Gemini 完整响应 ({len(response_text)}字符) ===\n{response_text}\n=== End Response ===")
+            
+            # 解析响应
+            result = self._parse_response(response_text, code, name)
+            result.raw_response = response_text
+            result.search_performed = bool(news_context)
+            
+            logger.info(f"[LLM解析] {name}({code}) 分析完成: {result.trend_prediction}, 评分 {result.sentiment_score}")
             
             return result
             
         except Exception as e:
-            # 捕获所有异常，确保单股失败不影响整体
-            logger.exception(f"[{code}] 处理过程发生未知异常: {e}")
-            return None
+            logger.error(f"AI 分析 {name}({code}) 失败: {e}")
+            return AnalysisResult(
+                code=code,
+                name=name,
+                sentiment_score=50,
+                trend_prediction='震荡',
+                operation_advice='持有',
+                confidence_level='低',
+                analysis_summary=f'分析过程出错: {str(e)[:100]}',
+                risk_warning='分析失败，请稍后重试或手动分析',
+                success=False,
+                error_message=str(e),
+            )
     
-    def run(
+    def _format_prompt(
         self, 
-        stock_codes: Optional[List[str]] = None,
-        dry_run: bool = False,
-        send_notification: bool = True
+        context: Dict[str, Any], 
+        name: str,
+        news_context: Optional[str] = None
+    ) -> str:
+        """
+        格式化分析提示词（决策仪表盘 v2.0）
+        
+        包含：技术指标、实时行情（量比/换手率）、筹码分布、趋势分析、新闻
+        
+        Args:
+            context: 技术面数据上下文（包含增强数据）
+            name: 股票名称（默认值，可能被上下文覆盖）
+            news_context: 预先搜索的新闻内容
+        """
+        code = context.get('code', 'Unknown')
+        
+        # 优先使用上下文中的股票名称（从 realtime_quote 获取）
+        stock_name = context.get('stock_name', name)
+        if not stock_name or stock_name == f'股票{code}':
+            stock_name = STOCK_NAME_MAP.get(code, f'股票{code}')
+            
+        today = context.get('today', {})
+        
+        # ========== 构建决策仪表盘格式的输入 ==========
+        prompt = f"""# 决策仪表盘分析请求
+
+## 📊 股票基础信息
+| 项目 | 数据 |
+|------|------|
+| 股票代码 | **{code}** |
+| 股票名称 | **{stock_name}** |
+| 分析日期 | {context.get('date', '未知')} |
+
+---
+
+## 📈 技术面数据
+
+### 今日行情
+| 指标 | 数值 |
+|------|------|
+| 收盘价 | {today.get('close', 'N/A')} 元 |
+| 开盘价 | {today.get('open', 'N/A')} 元 |
+| 最高价 | {today.get('high', 'N/A')} 元 |
+| 最低价 | {today.get('low', 'N/A')} 元 |
+| 涨跌幅 | {today.get('pct_chg', 'N/A')}% |
+| 成交量 | {self._format_volume(today.get('volume'))} |
+| 成交额 | {self._format_amount(today.get('amount'))} |
+
+### 均线系统（关键判断指标）
+| 均线 | 数值 | 说明 |
+|------|------|------|
+| MA5 | {today.get('ma5', 'N/A')} | 短期趋势线 |
+| MA10 | {today.get('ma10', 'N/A')} | 中短期趋势线 |
+| MA20 | {today.get('ma20', 'N/A')} | 中期趋势线 |
+| 均线形态 | {context.get('ma_status', '未知')} | 多头/空头/缠绕 |
+"""
+        
+        # 添加实时行情数据（量比、换手率等）
+        if 'realtime' in context:
+            rt = context['realtime']
+            prompt += f"""
+### 实时行情增强数据
+| 指标 | 数值 | 解读 |
+|------|------|------|
+| 当前价格 | {rt.get('price', 'N/A')} 元 | |
+| **量比** | **{rt.get('volume_ratio', 'N/A')}** | {rt.get('volume_ratio_desc', '')} |
+| **换手率** | **{rt.get('turnover_rate', 'N/A')}%** | |
+| 市盈率(动态) | {rt.get('pe_ratio', 'N/A')} | |
+| 市净率 | {rt.get('pb_ratio', 'N/A')} | |
+| 总市值 | {self._format_amount(rt.get('total_mv'))} | |
+| 流通市值 | {self._format_amount(rt.get('circ_mv'))} | |
+| 60日涨跌幅 | {rt.get('change_60d', 'N/A')}% | 中期表现 |
+"""
+        
+        # 添加筹码分布数据
+        if 'chip' in context:
+            chip = context['chip']
+            profit_ratio = chip.get('profit_ratio', 0)
+            prompt += f"""
+### 筹码分布数据（效率指标）
+| 指标 | 数值 | 健康标准 |
+|------|------|----------|
+| **获利比例** | **{profit_ratio:.1%}** | 70-90%时警惕 |
+| 平均成本 | {chip.get('avg_cost', 'N/A')} 元 | 现价应高于5-15% |
+| 90%筹码集中度 | {chip.get('concentration_90', 0):.2%} | <15%为集中 |
+| 70%筹码集中度 | {chip.get('concentration_70', 0):.2%} | |
+| 筹码状态 | {chip.get('chip_status', '未知')} | |
+"""
+        
+        # 添加趋势分析结果（基于交易理念的预判）
+        if 'trend_analysis' in context:
+            trend = context['trend_analysis']
+            bias_warning = "🚨 超过5%，严禁追高！" if trend.get('bias_ma5', 0) > 5 else "✅ 安全范围"
+            prompt += f"""
+### 趋势分析预判（基于交易理念）
+| 指标 | 数值 | 判定 |
+|------|------|------|
+| 趋势状态 | {trend.get('trend_status', '未知')} | |
+| 均线排列 | {trend.get('ma_alignment', '未知')} | MA5>MA10>MA20为多头 |
+| 趋势强度 | {trend.get('trend_strength', 0)}/100 | |
+| **乖离率(MA5)** | **{trend.get('bias_ma5', 0):+.2f}%** | {bias_warning} |
+| 乖离率(MA10) | {trend.get('bias_ma10', 0):+.2f}% | |
+| 量能状态 | {trend.get('volume_status', '未知')} | {trend.get('volume_trend', '')} |
+| 系统信号 | {trend.get('buy_signal', '未知')} | |
+| 系统评分 | {trend.get('signal_score', 0)}/100 | |
+
+#### 系统分析理由
+**买入理由**：
+{chr(10).join('- ' + r for r in trend.get('signal_reasons', ['无'])) if trend.get('signal_reasons') else '- 无'}
+
+**风险因素**：
+{chr(10).join('- ' + r for r in trend.get('risk_factors', ['无'])) if trend.get('risk_factors') else '- 无'}
+"""
+        
+        # 添加昨日对比数据
+        if 'yesterday' in context:
+            volume_change = context.get('volume_change_ratio', 'N/A')
+            prompt += f"""
+### 量价变化
+- 成交量较昨日变化：{volume_change}倍
+- 价格较昨日变化：{context.get('price_change_ratio', 'N/A')}%
+"""
+        
+        # 添加新闻搜索结果（重点区域）
+        prompt += """
+---
+
+## 📰 舆情情报
+"""
+        if news_context:
+            prompt += f"""
+以下是 **{stock_name}({code})** 近7日的新闻搜索结果，请重点提取：
+1. 🚨 **风险警报**：减持、处罚、利空
+2. 🎯 **利好催化**：业绩、合同、政策
+3. 📊 **业绩预期**：年报预告、业绩快报
+
+```
+{news_context}
+```
+"""
+        else:
+            prompt += """
+未搜索到该股票近期的相关新闻。请主要依据技术面数据进行分析。
+"""
+        
+        # 明确的输出要求
+        prompt += f"""
+---
+
+## ✅ 分析任务
+
+请为 **{stock_name}({code})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
+
+### 重点关注（必须明确回答）：
+1. ❓ 是否满足 MA5>MA10>MA20 多头排列？
+2. ❓ 当前乖离率是否在安全范围内（<5%）？—— 超过5%必须标注"严禁追高"
+3. ❓ 量能是否配合（缩量回调/放量突破）？
+4. ❓ 筹码结构是否健康？
+5. ❓ 消息面有无重大利空？（减持、处罚、业绩变脸等）
+
+### 决策仪表盘要求：
+- **核心结论**：一句话说清该买/该卖/该等
+- **持仓分类建议**：空仓者怎么做 vs 持仓者怎么做
+- **具体狙击点位**：买入价、止损价、目标价（精确到分）
+- **检查清单**：每项用 ✅/⚠️/❌ 标记
+
+请输出完整的 JSON 格式决策仪表盘。"""
+        
+        return prompt
+    
+    def _format_volume(self, volume: Optional[float]) -> str:
+        """格式化成交量显示"""
+        if volume is None:
+            return 'N/A'
+        if volume >= 1e8:
+            return f"{volume / 1e8:.2f} 亿股"
+        elif volume >= 1e4:
+            return f"{volume / 1e4:.2f} 万股"
+        else:
+            return f"{volume:.0f} 股"
+    
+    def _format_amount(self, amount: Optional[float]) -> str:
+        """格式化成交额显示"""
+        if amount is None:
+            return 'N/A'
+        if amount >= 1e8:
+            return f"{amount / 1e8:.2f} 亿元"
+        elif amount >= 1e4:
+            return f"{amount / 1e4:.2f} 万元"
+        else:
+            return f"{amount:.0f} 元"
+    
+    def _parse_response(
+        self, 
+        response_text: str, 
+        code: str, 
+        name: str
+    ) -> AnalysisResult:
+        """
+        解析 Gemini 响应（决策仪表盘版）
+        
+        尝试从响应中提取 JSON 格式的分析结果，包含 dashboard 字段
+        如果解析失败，尝试智能提取或返回默认结果
+        """
+        try:
+            # 清理响应文本：移除 markdown 代码块标记
+            cleaned_text = response_text
+            if '```json' in cleaned_text:
+                cleaned_text = cleaned_text.replace('```json', '').replace('```', '')
+            elif '```' in cleaned_text:
+                cleaned_text = cleaned_text.replace('```', '')
+            
+            # 尝试找到 JSON 内容
+            json_start = cleaned_text.find('{')
+            json_end = cleaned_text.rfind('}') + 1
+            
+            if json_start >= 0 and json_end > json_start:
+                json_str = cleaned_text[json_start:json_end]
+                
+                # 尝试修复常见的 JSON 问题
+                json_str = self._fix_json_string(json_str)
+                
+                data = json.loads(json_str)
+                
+                # 提取 dashboard 数据
+                dashboard = data.get('dashboard', None)
+                
+                # 解析所有字段，使用默认值防止缺失
+                return AnalysisResult(
+                    code=code,
+                    name=name,
+                    # 核心指标
+                    sentiment_score=int(data.get('sentiment_score', 50)),
+                    trend_prediction=data.get('trend_prediction', '震荡'),
+                    operation_advice=data.get('operation_advice', '持有'),
+                    confidence_level=data.get('confidence_level', '中'),
+                    # 决策仪表盘
+                    dashboard=dashboard,
+                    # 走势分析
+                    trend_analysis=data.get('trend_analysis', ''),
+                    short_term_outlook=data.get('short_term_outlook', ''),
+                    medium_term_outlook=data.get('medium_term_outlook', ''),
+                    # 技术面
+                    technical_analysis=data.get('technical_analysis', ''),
+                    ma_analysis=data.get('ma_analysis', ''),
+                    volume_analysis=data.get('volume_analysis', ''),
+                    pattern_analysis=data.get('pattern_analysis', ''),
+                    # 基本面
+                    fundamental_analysis=data.get('fundamental_analysis', ''),
+                    sector_position=data.get('sector_position', ''),
+                    company_highlights=data.get('company_highlights', ''),
+                    # 情绪面/消息面
+                    news_summary=data.get('news_summary', ''),
+                    market_sentiment=data.get('market_sentiment', ''),
+                    hot_topics=data.get('hot_topics', ''),
+                    # 综合
+                    analysis_summary=data.get('analysis_summary', '分析完成'),
+                    key_points=data.get('key_points', ''),
+                    risk_warning=data.get('risk_warning', ''),
+                    buy_reason=data.get('buy_reason', ''),
+                    # 元数据
+                    search_performed=data.get('search_performed', False),
+                    data_sources=data.get('data_sources', '技术面数据'),
+                    success=True,
+                )
+            else:
+                # 没有找到 JSON，尝试从纯文本中提取信息
+                logger.warning(f"无法从响应中提取 JSON，使用原始文本分析")
+                return self._parse_text_response(response_text, code, name)
+                
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON 解析失败: {e}，尝试从文本提取")
+            return self._parse_text_response(response_text, code, name)
+    
+    def _fix_json_string(self, json_str: str) -> str:
+        """修复常见的 JSON 格式问题"""
+        import re
+        
+        # 移除注释
+        json_str = re.sub(r'//.*?\n', '\n', json_str)
+        json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
+        
+        # 修复尾随逗号
+        json_str = re.sub(r',\s*}', '}', json_str)
+        json_str = re.sub(r',\s*]', ']', json_str)
+        
+        # 确保布尔值是小写
+        json_str = json_str.replace('True', 'true').replace('False', 'false')
+        
+        return json_str
+    
+    def _parse_text_response(
+        self, 
+        response_text: str, 
+        code: str, 
+        name: str
+    ) -> AnalysisResult:
+        """从纯文本响应中尽可能提取分析信息"""
+        # 尝试识别关键词来判断情绪
+        sentiment_score = 50
+        trend = '震荡'
+        advice = '持有'
+        
+        text_lower = response_text.lower()
+        
+        # 简单的情绪识别
+        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
+        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
+        
+        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
+        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
+        
+        if positive_count > negative_count + 1:
+            sentiment_score = 65
+            trend = '看多'
+            advice = '买入'
+        elif negative_count > positive_count + 1:
+            sentiment_score = 35
+            trend = '看空'
+            advice = '卖出'
+        
+        # 截取前500字符作为摘要
+        summary = response_text[:500] if response_text else '无分析结果'
+        
+        return AnalysisResult(
+            code=code,
+            name=name,
+            sentiment_score=sentiment_score,
+            trend_prediction=trend,
+            operation_advice=advice,
+            confidence_level='低',
+            analysis_summary=summary,
+            key_points='JSON解析失败，仅供参考',
+            risk_warning='分析结果可能不准确，建议结合其他信息判断',
+            raw_response=response_text,
+            success=True,
+        )
+    
+    def batch_analyze(
+        self, 
+        contexts: List[Dict[str, Any]],
+        delay_between: float = 2.0
     ) -> List[AnalysisResult]:
         """
-        运行完整的分析流程
+        批量分析多只股票
         
-        流程：
-        1. 获取待分析的股票列表
-        2. 使用线程池并发处理
-        3. 收集分析结果
-        4. 发送通知
+        注意：为避免 API 速率限制，每次分析之间会有延迟
         
         Args:
-            stock_codes: 股票代码列表（可选，默认使用配置中的自选股）
-            dry_run: 是否仅获取数据不分析
-            send_notification: 是否发送推送通知
+            contexts: 上下文数据列表
+            delay_between: 每次分析之间的延迟（秒）
             
         Returns:
-            分析结果列表
+            AnalysisResult 列表
         """
-        start_time = time.time()
+        results = []
         
-        # 使用配置中的股票列表
-        if stock_codes is None:
-            self.config.refresh_stock_list()
-            stock_codes = self.config.stock_list
-        
-        if not stock_codes:
-            logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")
-            return []
-        
-        logger.info(f"===== 开始分析 {len(stock_codes)} 只股票 =====")
-        logger.info(f"股票列表: {', '.join(stock_codes)}")
-        logger.info(f"并发数: {self.max_workers}, 模式: {'仅获取数据' if dry_run else '完整分析'}")
-        
-        results: List[AnalysisResult] = []
-        
-        # 使用线程池并发处理
-        # 注意：max_workers 设置较低（默认3）以避免触发反爬
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 提交任务
-            future_to_code = {
-                executor.submit(
-                    self.process_single_stock, 
-                    code, 
-                    skip_analysis=dry_run
-                ): code
-                for code in stock_codes
-            }
+        for i, context in enumerate(contexts):
+            if i > 0:
+                logger.debug(f"等待 {delay_between} 秒后继续...")
+                time.sleep(delay_between)
             
-            # 收集结果
-            for future in as_completed(future_to_code):
-                code = future_to_code[future]
-                try:
-                    result = future.result()
-                    if result:
-                        results.append(result)
-                except Exception as e:
-                    logger.error(f"[{code}] 任务执行失败: {e}")
-        
-        # 统计
-        elapsed_time = time.time() - start_time
-        
-        # dry-run 模式下，数据获取成功即视为成功
-        if dry_run:
-            # 检查哪些股票的数据今天已存在
-            success_count = sum(1 for code in stock_codes if self.db.has_today_data(code))
-            fail_count = len(stock_codes) - success_count
-        else:
-            success_count = len(results)
-            fail_count = len(stock_codes) - success_count
-        
-        logger.info(f"===== 分析完成 =====")
-        logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
-        
-        # 发送通知
-        if results and send_notification and not dry_run:
-            self._send_notifications(results)
+            result = self.analyze(context)
+            results.append(result)
         
         return results
-    
-    def _send_notifications(self, results: List[AnalysisResult]) -> None:
-        """
-        发送分析结果通知
-        
-        生成决策仪表盘格式的报告
-        
-        Args:
-            results: 分析结果列表
-        """
-        try:
-            logger.info("生成决策仪表盘日报...")
-            
-            # 生成决策仪表盘格式的详细日报
-            report = self.notifier.generate_dashboard_report(results)
-            
-            # 保存到本地
-            filepath = self.notifier.save_report_to_file(report)
-            logger.info(f"决策仪表盘日报已保存: {filepath}")
-            
-            # 推送通知
-            if self.notifier.is_available():
-                channels = self.notifier.get_available_channels()
-
-                # 企业微信：只发精简版（平台限制）
-                wechat_success = False
-                if NotificationChannel.WECHAT in channels:
-                    dashboard_content = self.notifier.generate_wechat_dashboard(results)
-                    logger.info(f"企业微信仪表盘长度: {len(dashboard_content)} 字符")
-                    logger.debug(f"企业微信推送内容:\n{dashboard_content}")
-                    wechat_success = self.notifier.send_to_wechat(dashboard_content)
-
-                # 其他渠道：发完整报告（避免自定义 Webhook 被 wechat 截断逻辑污染）
-                non_wechat_success = False
-                for channel in channels:
-                    if channel == NotificationChannel.WECHAT:
-                        continue
-                    if channel == NotificationChannel.FEISHU:
-                        non_wechat_success = self.notifier.send_to_feishu(report) or non_wechat_success
-                    if channel == NotificationChannel.DINGTALK:
-                        non_wechat_success = self.notifier.send_to_dingtalk(report) or non_wechat_success
-                    elif channel == NotificationChannel.TELEGRAM:
-                        non_wechat_success = self.notifier.send_to_telegram(report) or non_wechat_success
-                    elif channel == NotificationChannel.EMAIL:
-                        non_wechat_success = self.notifier.send_to_email(report) or non_wechat_success
-                    elif channel == NotificationChannel.CUSTOM:
-                        non_wechat_success = self.notifier.send_to_custom(report) or non_wechat_success
-                    else:
-                        logger.warning(f"未知通知渠道: {channel}")
-
-                success = wechat_success or non_wechat_success
-                if success:
-                    logger.info("决策仪表盘推送成功")
-                else:
-                    logger.warning("决策仪表盘推送失败")
-            else:
-                logger.info("通知渠道未配置，跳过推送")
-                
-        except Exception as e:
-            logger.error(f"发送通知失败: {e}")
 
 
-def parse_arguments() -> argparse.Namespace:
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(
-        description='A股自选股智能分析系统',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-示例:
-  python main.py                    # 正常运行
-  python main.py --debug            # 调试模式
-  python main.py --dry-run          # 仅获取数据，不进行 AI 分析
-  python main.py --stocks 600519,000001  # 指定分析特定股票
-  python main.py --no-notify        # 不发送推送通知
-  python main.py --schedule         # 启用定时任务模式
-  python main.py --market-review    # 仅运行大盘复盘
-        '''
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='启用调试模式，输出详细日志'
-    )
-    
-    parser.add_argument(
-        '--dry-run',
-        action='store_true',
-        help='仅获取数据，不进行 AI 分析'
-    )
-    
-    parser.add_argument(
-        '--stocks',
-        type=str,
-        help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
-    )
-    
-    parser.add_argument(
-        '--no-notify',
-        action='store_true',
-        help='不发送推送通知'
-    )
-    
-    parser.add_argument(
-        '--workers',
-        type=int,
-        default=None,
-        help='并发线程数（默认使用配置值）'
-    )
-    
-    parser.add_argument(
-        '--schedule',
-        action='store_true',
-        help='启用定时任务模式，每日定时执行'
-    )
-    
-    parser.add_argument(
-        '--market-review',
-        action='store_true',
-        help='仅运行大盘复盘分析'
-    )
-    
-    parser.add_argument(
-        '--no-market-review',
-        action='store_true',
-        help='跳过大盘复盘分析'
-    )
-    
-    return parser.parse_args()
-
-
-def run_market_review(notifier: NotificationService, analyzer=None, search_service=None) -> Optional[str]:
-    """
-    执行大盘复盘分析
-    
-    Args:
-        notifier: 通知服务
-        analyzer: AI分析器（可选）
-        search_service: 搜索服务（可选）
-    
-    Returns:
-        复盘报告文本
-    """
-    logger.info("开始执行大盘复盘分析...")
-    
-    try:
-        market_analyzer = MarketAnalyzer(
-            search_service=search_service,
-            analyzer=analyzer
-        )
-        
-        # 执行复盘
-        review_report = market_analyzer.run_daily_review()
-        
-        if review_report:
-            # 保存报告到文件
-            date_str = datetime.now().strftime('%Y%m%d')
-            report_filename = f"market_review_{date_str}.md"
-            filepath = notifier.save_report_to_file(
-                f"# 🎯 大盘复盘\n\n{review_report}", 
-                report_filename
-            )
-            logger.info(f"大盘复盘报告已保存: {filepath}")
-            
-            # 推送通知
-            if notifier.is_available():
-                # 添加标题
-                report_content = f"🎯 大盘复盘\n\n{review_report}"
-                
-                success = notifier.send(report_content)
-                if success:
-                    logger.info("大盘复盘推送成功")
-                else:
-                    logger.warning("大盘复盘推送失败")
-            
-            return review_report
-        
-    except Exception as e:
-        logger.error(f"大盘复盘分析失败: {e}")
-    
-    return None
-
-
-def run_full_analysis(
-    config: Config,
-    args: argparse.Namespace,
-    stock_codes: Optional[List[str]] = None
-):
-    """
-    执行完整的分析流程（个股 + 大盘复盘）
-    
-    这是定时任务调用的主函数
-    """
-    try:
-        # 创建调度器
-        pipeline = StockAnalysisPipeline(
-            config=config,
-            max_workers=args.workers
-        )
-        
-        # 1. 运行个股分析
-        results = pipeline.run(
-            stock_codes=stock_codes,
-            dry_run=args.dry_run,
-            send_notification=not args.no_notify
-        )
-        
-        # 2. 运行大盘复盘（如果启用且不是仅个股模式）
-        market_report = ""
-        if config.market_review_enabled and not args.no_market_review:
-            # 只调用一次，并获取结果
-            review_result = run_market_review(
-                notifier=pipeline.notifier,
-                analyzer=pipeline.analyzer,
-                search_service=pipeline.search_service
-            )
-            # 如果有结果，赋值给 market_report 用于后续飞书文档生成
-            if review_result:
-                market_report = review_result
-        
-        # 输出摘要
-        if results:
-            logger.info("\n===== 分析结果摘要 =====")
-            for r in sorted(results, key=lambda x: x.sentiment_score, reverse=True):
-                emoji = r.get_emoji()
-                logger.info(
-                    f"{emoji} {r.name}({r.code}): {r.operation_advice} | "
-                    f"评分 {r.sentiment_score} | {r.trend_prediction}"
-                )
-        
-        logger.info("\n任务执行完成")
-
-        # === 新增：生成飞书云文档 ===
-        try:
-            feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
-                logger.info("正在创建飞书云文档...")
-
-                # 1. 准备标题 "01-01 13:01大盘复盘"
-                tz_cn = timezone(timedelta(hours=8))
-                now = datetime.now(tz_cn)
-                doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
-
-                # 2. 准备内容 (拼接个股分析和大盘复盘)
-                full_content = ""
-
-                # 添加大盘复盘内容（如果有）
-                if market_report:
-                    full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-
-                # 添加个股决策仪表盘（使用 NotificationService 生成）
-                if results:
-                    dashboard_content = pipeline.notifier.generate_dashboard_report(results)
-                    full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
-
-                # 3. 创建文档
-                doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
-                if doc_url:
-                    logger.info(f"飞书云文档创建成功: {doc_url}")
-                    # 可选：将文档链接也推送到群里
-                    pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
-
-        except Exception as e:
-            logger.error(f"飞书文档生成失败: {e}")
-        
-    except Exception as e:
-        logger.exception(f"分析流程执行失败: {e}")
-
-
-def main() -> int:
-    """
-    主入口函数
-    
-    Returns:
-        退出码（0 表示成功）
-    """
-    # 解析命令行参数
-    args = parse_arguments()
-    
-    # 加载配置（在设置日志前加载，以获取日志目录）
-    config = get_config()
-    
-    # 配置日志（输出到控制台和文件）
-    setup_logging(debug=args.debug, log_dir=config.log_dir)
-    
-    logger.info("=" * 60)
-    logger.info("A股自选股智能分析系统 启动")
-    logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
-    
-    # 验证配置
-    warnings = config.validate()
-    for warning in warnings:
-        logger.warning(warning)
-    
-    # 解析股票列表
-    stock_codes = None
-    if args.stocks:
-        stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
-        logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-    
-    try:
-        # 模式1: 仅大盘复盘
-        if args.market_review:
-            logger.info("模式: 仅大盘复盘")
-            notifier = NotificationService()
-            
-            # 初始化搜索服务和分析器（如果有配置）
-            search_service = None
-            analyzer = None
-            
-            if config.tavily_api_keys or config.serpapi_keys:
-                search_service = SearchService(
-                    tavily_keys=config.tavily_api_keys,
-                    serpapi_keys=config.serpapi_keys
-                )
-            
-            if config.gemini_api_key:
-                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
-            
-            run_market_review(notifier, analyzer, search_service)
-            return 0
-        
-        # 模式2: 定时任务模式
-        if args.schedule or config.schedule_enabled:
-            logger.info("模式: 定时任务")
-            logger.info(f"每日执行时间: {config.schedule_time}")
-            
-            from scheduler import run_with_schedule
-            
-            def scheduled_task():
-                run_full_analysis(config, args, stock_codes)
-            
-            run_with_schedule(
-                task=scheduled_task,
-                schedule_time=config.schedule_time,
-                run_immediately=True  # 启动时先执行一次
-            )
-            return 0
-        
-        # 模式3: 正常单次运行
-        run_full_analysis(config, args, stock_codes)
-        
-        logger.info("\n程序执行完成")
-        return 0
-        
-    except KeyboardInterrupt:
-        logger.info("\n用户中断，程序退出")
-        return 130
-        
-    except Exception as e:
-        logger.exception(f"程序执行失败: {e}")
-        return 1
+# 便捷函数
+def get_analyzer() -> GeminiAnalyzer:
+    """获取 Gemini 分析器实例"""
+    return GeminiAnalyzer()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 测试代码
+    logging.basicConfig(level=logging.DEBUG)
+    
+    # 模拟上下文数据
+    test_context = {
+        'code': '600519',
+        'date': '2026-01-09',
+        'today': {
+            'open': 1800.0,
+            'high': 1850.0,
+            'low': 1780.0,
+            'close': 1820.0,
+            'volume': 10000000,
+            'amount': 18200000000,
+            'pct_chg': 1.5,
+            'ma5': 1810.0,
+            'ma10': 1800.0,
+            'ma20': 1790.0,
+            'volume_ratio': 1.2,
+        },
+        'ma_status': '多头排列 📈',
+        'volume_change_ratio': 1.3,
+        'price_change_ratio': 1.5,
+    }
+    
+    analyzer = GeminiAnalyzer()
+    
+    if analyzer.is_available():
+        print("=== AI 分析测试 ===")
+        result = analyzer.analyze(test_context)
+        print(f"分析结果: {result.to_dict()}")
+    else:
+        print("Gemini API 未配置，跳过测试")
