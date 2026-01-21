@@ -308,7 +308,9 @@ class GeminiAnalyzer:
                 "ideal_buy": "理想买入点：XX元（在MA5附近）",
                 "secondary_buy": "次优买入点：XX元（在MA10附近）",
                 "stop_loss": "止损位：XX元（跌破MA20或X%）",
-                "take_profit": "目标位：XX元（前高/整数关口）"
+                "take_profit": "目标位：XX元（前高/整数关口）",
+                "current_price": "当前价格数值：XX元",
+                "current_price_date": "当前价格数值（精确到秒）"
             },
             "position_strategy": {
                 "suggested_position": "建议仓位：X成",
