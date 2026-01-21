@@ -617,6 +617,7 @@ class NotificationService:
                         f"| 🔵 次优买入点 | {sniper.get('secondary_buy', 'N/A')} |",
                         f"| 🛑 止损位 | {sniper.get('stop_loss', 'N/A')} |",
                         f"| 🎊 目标位 | {sniper.get('take_profit', 'N/A')} |",
+                        f"| 当前价位 | {sniper.get('current_price', 'N/A')}(获取时间：{sniper.get('current_price_date', 'N/A')}) |",
                         "",
                     ])
                 
