@@ -1594,22 +1594,23 @@ class NotificationService:
         card_payload = {
             "msg_type": "interactive",
             "card": {
-                "config": {"wide_screen_mode": True},
+                "body": {
+                    "elements": [
+                        {
+                            "content": content,
+                            "tag": "markdown"
+                        }
+                    ]
+                },
                 "header": {
+                    "padding": "12px 8px 12px 8px",
+                    "template": "blue",
                     "title": {
-                        "tag": "plain_text",
-                        "content": "A股智能分析报告"
+                        "content": "致富密码",
+                        "tag": "plain_text"
                     }
                 },
-                "elements": [
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": content
-                        }
-                    }
-                ]
+                "schema": "2.0"
             }
         }
 
